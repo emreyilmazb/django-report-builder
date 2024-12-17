@@ -5,7 +5,7 @@ from decimal import Decimal
 from functools import reduce
 import zipfile
 from io import BytesIO
-
+from django.utils import timezone
 from dateutil import parser
 from django import forms
 from django.conf import settings
@@ -459,58 +459,85 @@ class Report(models.Model):
         file_type=None,
         email_to: str = None,
     ):
+        logger.info("async_report_save started: title=%s, file_type=%s", title, file_type)
+        logger.info("MEDIA_ROOT= %s", {settings.MEDIA_ROOT})
+
         if file_type not in ["csv", "xlsx"]:
+            logger.error("Invalid file_type provided: %s", file_type)
             raise ValueError("file_type must be 'csv' or 'xlsx'")
 
         data_export = DataExportMixin()
-        if len(chunks) == 1:
-            single_chunk = chunks[0]
-            if file_type == "csv":
-                csv_file = data_export.list_to_csv_file(
-                    single_chunk, title, header, widths
-                )
-                file_name = generate_filename(title, ".csv")
-                self.report_file.save(
-                    file_name, ContentFile(csv_file.getvalue().encode())
-                )
-            elif file_type == "xlsx":
-                xlsx_file = data_export.list_to_xlsx_file(
-                    single_chunk, title, header, widths
-                )
-                file_name = generate_filename(title, ".xlsx")
-                self.report_file.save(file_name, ContentFile(xlsx_file.read()))
-            self.report_file_creation = datetime.datetime.today()
-            self.save()
-            return
+        try:
+            if len(chunks) == 1:
+                single_chunk = chunks[0]
+                logger.info("Processing single chunk for title: %s", title)
+                
+                if file_type == "csv":
+                    logger.debug("Generating CSV file...")
+                    csv_file = data_export.list_to_csv_file(
+                        single_chunk, title, header, widths
+                    )
+                    file_name = generate_filename(title, ".csv")
+                    self.report_file.save(
+                        file_name, ContentFile(csv_file.getvalue().encode())
+                    )
+                    logger.info("CSV file saved successfully: %s", file_name)
 
-        else:
-            zip_buffer = BytesIO()
+                elif file_type == "xlsx":
+                    logger.debug("Generating XLSX file...")
+                    xlsx_file = data_export.list_to_xlsx_file(
+                        single_chunk, title, header, widths
+                    )
+                    file_name = generate_filename(title, ".xlsx")
+                    self.report_file.save(file_name, ContentFile(xlsx_file.read()))
+                    logger.info("XLSX file saved successfully: %s", file_name)
 
-            with zipfile.ZipFile(zip_buffer, "w") as zip_file:
-                for index, chunk in enumerate(chunks):
-                    chunk_title = f"{title}_part{index + 1}.{file_type}"
-                    if file_type == "csv":
-                        csv_file = data_export.list_to_csv_file(
-                            chunk, chunk_title, header, widths
-                        )
-                        zip_file.writestr(chunk_title, csv_file.getvalue().encode())
-                    elif file_type == "xlsx":
-                        xlsx_file = data_export.list_to_xlsx_file(
-                            chunk, chunk_title, header, widths
-                        )
-                        zip_file.writestr(chunk_title, xlsx_file.read())
+                self.report_file_creation = timezone.now()
+                self.save()
+                logger.info("Report file creation date updated.")
+                return
 
-            zip_filename = f"{title}.zip"
-            self.report_file.save(zip_filename, ContentFile(zip_buffer.getvalue()))
-            self.report_file_creation = datetime.datetime.today()
-            self.save()
+            else:
+                logger.info("Processing multiple chunks for title: %s", title)
+                zip_buffer = BytesIO()
 
-            if email_to:
-                for email in email_to:
-                    self.email_report(email=email)
-            elif getattr(settings, "REPORT_BUILDER_EMAIL_NOTIFICATION", False):
-                if user and user.email:
-                    self.email_report(user=user)
+                with zipfile.ZipFile(zip_buffer, "w") as zip_file:
+                    for index, chunk in enumerate(chunks):
+                        chunk_title = f"{title}_part{index + 1}.{file_type}"
+                        logger.debug("Processing chunk %d: %s", index + 1, chunk_title)
+                        
+                        if file_type == "csv":
+                            csv_file = data_export.list_to_csv_file(
+                                chunk, chunk_title, header, widths
+                            )
+                            zip_file.writestr(chunk_title, csv_file.getvalue().encode())
+                        elif file_type == "xlsx":
+                            xlsx_file = data_export.list_to_xlsx_file(
+                                chunk, chunk_title, header, widths
+                            )
+                            zip_file.writestr(chunk_title, xlsx_file.read())
+
+                zip_filename = f"{title}.zip"
+                self.report_file.save(zip_filename, ContentFile(zip_buffer.getvalue()))
+                logger.info("ZIP file saved successfully: %s", zip_filename)
+
+                self.report_file_creation = timezone.now()
+                self.save()
+                logger.info("Report file creation date updated.")
+
+                if email_to:
+                    logger.info("Sending report via email to: %s", email_to)
+                    for email in email_to:
+                        self.email_report(email=email)
+                        logger.info("Email sent to: %s", email)
+                elif getattr(settings, "REPORT_BUILDER_EMAIL_NOTIFICATION", False):
+                    if user and user.email:
+                        logger.info("Sending report to user email: %s", user.email)
+                        self.email_report(user=user)
+
+        except Exception as e:
+            logger.error("An error occurred during async_report_save: %s", str(e), exc_info=True)
+            raise
 
     @staticmethod
     def chunk_data(data, chunk_size):
